@@ -6,9 +6,17 @@ import (
 )
 
 func main() {
-	mux := http.NewServeMux()
-	err := http.ListenAndServe(":8080", mux)
+	router := http.NewServeMux()
+	server := &http.Server{
+		Handler: router,
+		Addr:    ":8080",
+	}
+
+	router.Handle("/", http.FileServer(http.Dir(".")))
+	router.Handle("/about", http.FileServer(http.Dir("./assets")))
+
+	err := server.ListenAndServe()
 	if err != nil {
-		log.Fatalf("failed to serve")
+		log.Fatalf("failed to serve: %w", err)
 	}
 }
