@@ -12,8 +12,14 @@ func main() {
 		Addr:    ":8080",
 	}
 
-	router.Handle("/", http.FileServer(http.Dir(".")))
-	router.Handle("/about", http.FileServer(http.Dir("./assets")))
+	router.Handle("/app/", http.StripPrefix("/app/", http.FileServer(http.Dir("."))))
+	router.Handle("/app/assets", http.StripPrefix("/app/assets", http.FileServer(http.Dir("./assets"))))
+
+	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(200)
+		w.Write([]byte("OK"))
+	})
 
 	err := server.ListenAndServe()
 	if err != nil {
