@@ -1,17 +1,25 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync/atomic"
+
+	"github.com/ayush-anav/chirpy/internal/database"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq" // postgres driver, _ means we will use as side-effect
 )
 
 type ApiConfig struct {
 	FileserverHits atomic.Int32 // allows us to increment int and read across go-routines
 	// it is already 0 valid, so we can define our struct via
 	// variableName := &ApiConfig
+	db *database.Queries // place where our queries live
 }
 
 func (cfg *ApiConfig) MiddlewareMetricsInc(next http.Handler) http.Handler {
@@ -23,7 +31,26 @@ func (cfg *ApiConfig) MiddlewareMetricsInc(next http.Handler) http.Handler {
 }
 
 func main() {
-	cfg := &ApiConfig{}
+	// load our fken env file
+	godotenv.Load()
+
+	// get the URL
+	dbURL := os.Getenv("DB_URL")
+
+	// setup connection to DB
+	db, dbErr := sql.Open("postgres", dbURL)
+
+	if dbErr != nil {
+		log.Fatalf("Could not setup connection to DB")
+	}
+
+	// hookup db to database from our sqlc to get
+	// access to queries
+	dbQueries := database.New(db)
+
+	cfg := &ApiConfig{
+		db: dbQueries, // now all our func can use db methods e.g cfg.db.createUser()
+	}
 
 	router := http.NewServeMux()
 	server := &http.Server{
@@ -79,15 +106,38 @@ func main() {
 			return
 		}
 
-		// ok
-		respondWithJSON(w, 200)
+		// check profanity and pass the struct that you want respondwithjson to use
+		respStruct := checkProfanity(reqBody.Body)
+		respondWithJSON(w, 200, respStruct)
 	})
 
-	
 	err := server.ListenAndServe()
 	if err != nil {
 		log.Fatalf("failed to serve: %w", err)
 	}
+}
+
+func checkProfanity(body string) interface{} {
+	type Profanity struct {
+		CleanedBody string `json:"cleaned_body"`
+	}
+
+	badWords := []string{"kerfuffle", "sharbert", "fornax"}
+	reqSlice := strings.Split(body, " ")
+	// badWordPresent := false
+
+	for i, reqWord := range reqSlice {
+		for _, badWord := range badWords {
+			if strings.EqualFold(reqWord, badWord) {
+				reqSlice[i] = "****"
+				// badWordPresent = true
+			}
+		}
+	}
+
+	profanityExists := Profanity{CleanedBody: strings.Join(reqSlice, " ")}
+	return profanityExists
+
 }
 
 func respondWithError(w http.ResponseWriter, code int, msg string) {
@@ -109,15 +159,10 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 	w.Write(data)
 }
 
-func respondWithJSON(w http.ResponseWriter, code int) {
+func respondWithJSON(w http.ResponseWriter, code int, respStruct interface{}) {
 	// interface{} = empty struct
-	type Successful struct {
-		Valid bool `json:"valid"`
-	}
 
-	succ := Successful{Valid: true}
-
-	data, err := json.Marshal(succ)
+	data, err := json.Marshal(respStruct)
 	// if marshal is unsuccessful
 	if err != nil {
 		w.WriteHeader(500)

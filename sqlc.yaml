@@ -1,0 +1,8 @@
+version: "2"
+sql:
+  - schema: "sql/schema"  # look in sql/schema for schema, it will ignore the down migration
+    queries: "sql/queries" # look here for sql queries
+    engine: "postgresql" 
+    gen:
+      go:
+        out: "internal/database" # generate GO code here
