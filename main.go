@@ -9,8 +9,11 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/ayush-anav/chirpy/internal/auth"
 	"github.com/ayush-anav/chirpy/internal/database"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq" // postgres driver, _ means we will use as side-effect
 )
@@ -19,7 +22,15 @@ type ApiConfig struct {
 	FileserverHits atomic.Int32 // allows us to increment int and read across go-routines
 	// it is already 0 valid, so we can define our struct via
 	// variableName := &ApiConfig
-	db *database.Queries // place where our queries live
+	db  *database.Queries // place where our queries live
+	env string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
 }
 
 func (cfg *ApiConfig) MiddlewareMetricsInc(next http.Handler) http.Handler {
@@ -49,7 +60,8 @@ func main() {
 	dbQueries := database.New(db)
 
 	cfg := &ApiConfig{
-		db: dbQueries, // now all our func can use db methods e.g cfg.db.createUser()
+		db:  dbQueries, // now all our func can use db methods e.g cfg.db.createUser()
+		env: os.Getenv("PLATFORM"),
 	}
 
 	router := http.NewServeMux()
@@ -79,22 +91,15 @@ func main() {
 			cfg.FileserverHits.Load())))
 	})
 
-	router.HandleFunc("POST /admin/reset", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		cfg.FileserverHits.Store(0)
-	})
-
-	router.HandleFunc("POST /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
-		// take the incoming body
-		// if len > 140, respond with err msg which is JSON body of this shape {"error": "Chirp is too long"}
-		// same story for other err we check
-		// respondWithError(w, CODE, msg)
+	router.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
 		type RequestStruct struct {
-			Body string `json:"body"`
+			Body   string    `json:"body"`
+			UserId uuid.UUID `json:"user_id"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
 		var reqBody RequestStruct
+
 		// failed to decode, server err
 		if err := decoder.Decode(&reqBody); err != nil {
 			respondWithError(w, 500, "Something went wrong")
@@ -107,20 +112,222 @@ func main() {
 		}
 
 		// check profanity and pass the struct that you want respondwithjson to use
-		respStruct := checkProfanity(reqBody.Body)
-		respondWithJSON(w, 200, respStruct)
+		cleanedBody := checkProfanity(reqBody.Body)
+
+		type SuccessfulResponse struct {
+			Body   string    `json:"body"`
+			UserID uuid.UUID `json:"user_id"`
+			ID     uuid.UUID `json:"id"`
+		}
+
+		newChirp := database.AddChirpParams{
+			Body:   cleanedBody.CleanedBody,
+			UserID: reqBody.UserId,
+		}
+
+		// insert resp struct to db here:
+		DBRes, errAdding := cfg.db.AddChirp(r.Context(), newChirp)
+
+		sendRespToClient := SuccessfulResponse{
+			Body:   cleanedBody.CleanedBody,
+			UserID: reqBody.UserId,
+			ID:     DBRes.ID,
+		}
+
+		if errAdding != nil {
+			respondWithError(w, 500, "Failed to save to DB!")
+		}
+
+		respondWithJSON(w, 201, sendRespToClient)
+	})
+
+	router.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
+		type RequestStruct struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+
+		// CLIENT REQUEST STRUCT
+		var clientRequest RequestStruct
+
+		if err := decoder.Decode(&clientRequest); err != nil {
+			respondWithError(w, 500, "Could not decode Request Body -> Struct")
+			log.Printf("Error: r.Body -> Struct: %s", err)
+			return
+		}
+
+		hash, errHash := auth.HashPassword(clientRequest.Password)
+		if errHash != nil {
+			respondWithError(w, 500, "Internal Server Error")
+			log.Printf("Failed to hash password %s", errHash)
+			return
+		}
+
+		newUser := database.CreateUserParams{
+			Email:          clientRequest.Email,
+			HashedPassword: hash,
+		}
+
+		dbUserStruct, dbErr := cfg.db.CreateUser(r.Context(), newUser)
+
+		if dbErr != nil {
+			respondWithError(w, 500, "Failed to insert to DB")
+			log.Printf("Failed to insert DB %s", dbErr)
+			return
+		}
+
+		resp := User{
+			ID:        dbUserStruct.ID,
+			CreatedAt: dbUserStruct.CreatedAt,
+			UpdatedAt: dbUserStruct.UpdatedAt,
+			Email:     dbUserStruct.Email,
+		}
+
+		respondWithJSON(w, 201, resp)
+	})
+
+	router.HandleFunc("POST /admin/reset", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.env != "dev" {
+			respondWithError(w, 403, "Forbidden")
+			return
+		}
+
+		err := cfg.db.ResetUsers(r.Context())
+		if err != nil {
+			respondWithError(w, 500, "failed to delete users")
+			return
+		}
+	})
+
+	router.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		allChirps, getErr := cfg.db.GetAllChirps(r.Context())
+
+		if getErr != nil {
+			respondWithError(w, 500, "failed to get resource")
+			return
+		}
+
+		type Chirps struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserID    uuid.UUID `json:"user_id"`
+		}
+
+		responseArr := []Chirps{}
+
+		for _, chirp := range allChirps {
+			serverResponse := Chirps{
+				ID:        chirp.ID,
+				CreatedAt: chirp.CreatedAt,
+				UpdatedAt: chirp.UpdatedAt,
+				Body:      chirp.Body,
+				UserID:    chirp.UserID,
+			}
+			responseArr = append(responseArr, serverResponse)
+		}
+
+		respondWithJSON(w, 200, responseArr)
+	})
+
+	router.HandleFunc("GET /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		chirpString := r.PathValue("chirpID")
+		chirpID, errParse := uuid.Parse(chirpString)
+		if errParse != nil {
+			respondWithError(w, 500, "could not gen UUID from supplied url")
+			return
+		}
+
+		chirp, errGetChirpID := cfg.db.GetChripsID(r.Context(), uuid.UUID(chirpID))
+
+		if errGetChirpID != nil {
+			respondWithError(w, 404, "Resource not found!")
+		}
+
+		type Chirps struct {
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserID    uuid.UUID `json:"user_id"`
+		}
+
+		serverResponse := Chirps{
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID,
+		}
+
+		respondWithJSON(w, 200, serverResponse)
+
+	})
+
+	router.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
+		// read pasword and email from r.Body
+		type IncomingRequest struct {
+			Password string `json:"password"`
+			Email    string `json:"email"`
+		}
+
+		var userRequest IncomingRequest
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&userRequest); err != nil {
+			respondWithError(w, 500, "Internal Server Error")
+			log.Printf("Failed to decode req.Body -> Struct: %s", err)
+			return
+		}
+
+		// get the user from sql and take the password from the user and check
+		dbUser, err := cfg.db.GetUserByEmail(r.Context(), userRequest.Email)
+
+		if err != nil {
+			respondWithError(w, 500, "Internal Error")
+			log.Printf("Could not fetch user from DB: %s", err)
+			return
+		}
+
+		match, err := auth.CheckPasswordHash(userRequest.Password, dbUser.HashedPassword)
+		if err != nil {
+			respondWithError(w, 500, "Internal Match Error")
+			log.Printf("Could not do ComparePasswordAndHash: %s", err)
+			return
+		}
+
+		if match {
+			type User struct {
+				ID        uuid.UUID `json:"id"`
+				CreatedAt time.Time `json:"created_at"`
+				UpdatedAt time.Time `json:"updated_at"`
+				Email     string    `json:"email"`
+			}
+			sendRespToClient := User{
+				ID:        dbUser.ID,
+				CreatedAt: dbUser.CreatedAt,
+				UpdatedAt: dbUser.UpdatedAt,
+				Email:     dbUser.Email,
+			}
+
+			respondWithJSON(w, 200, sendRespToClient)
+		} else {
+			respondWithJSON(w, 401, "Unauthorized")
+		}
 	})
 
 	err := server.ListenAndServe()
 	if err != nil {
-		log.Fatalf("failed to serve: %w", err)
+		log.Fatalf("failed to serve: %s", err)
 	}
+
 }
 
-func checkProfanity(body string) interface{} {
-	type Profanity struct {
-		CleanedBody string `json:"cleaned_body"`
-	}
+type Profanity struct {
+	CleanedBody string `json:"cleaned_body"`
+}
+
+func checkProfanity(body string) Profanity {
 
 	badWords := []string{"kerfuffle", "sharbert", "fornax"}
 	reqSlice := strings.Split(body, " ")
